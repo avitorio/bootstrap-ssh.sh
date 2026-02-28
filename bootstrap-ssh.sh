@@ -7,19 +7,20 @@ set -euo pipefail
 #  1) Creates a new user (if missing) with /bin/bash + home dir
 #  2) Adds user to sudo (Debian/Ubuntu) or wheel (RHEL/CentOS/Amazon Linux)
 #  3) Copies /root/.ssh/authorized_keys to the new user (secure perms/ownership)
-#  4) Updates sshd_config to disable root login and password authentication
-#  5) Validates sshd config (if possible) and reloads ssh/sshd
+#  4) Locks the user's password (no password login)
+#  5) Enables passwordless sudo for the new user (sudo won't ask for a password)
+#  6) Updates sshd_config to disable root SSH login and password authentication
+#  7) Validates sshd config (if possible) and reloads ssh/sshd
 #
 # Usage:
 #   sudo ./bootstrap-ssh.sh <username>
 #
 # Remote usage:
-#   curl -fsSL https://example.com/bootstrap-ssh.sh | sudo bash -s -- <username>
+#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<branch>/bootstrap-ssh.sh | sudo bash -s -- <username>
 #
 # Notes:
 # - Keep your current root session open.
 # - After running, test: ssh <username>@<server> in a NEW terminal.
-# - In non-interactive runs (curl | bash), password setup is skipped and the account password is locked.
 
 NEW_USER="${1:-}"
 
@@ -53,15 +54,6 @@ ensure_user() {
   else
     log "Creating user '${NEW_USER}'"
     useradd -m -s /bin/bash "${NEW_USER}"
-
-    if [[ -t 0 && -t 1 ]]; then
-      echo "Optional: set a password for '${NEW_USER}' (Ctrl+C to skip)."
-      passwd "${NEW_USER}" || echo "Password setup failed or skipped; continuing with SSH keys only."
-    else
-      echo "Non-interactive run; skipping password setup."
-      # Lock password so it can't be used for login (SSH keys + sudo is enough)
-      passwd -l "${NEW_USER}" >/dev/null 2>&1 || true
-    fi
   fi
 }
 
@@ -99,6 +91,26 @@ copy_ssh_keys() {
   fi
 }
 
+lock_user_password() {
+  log "Locking password for '${NEW_USER}' (SSH keys only)"
+  passwd -l "${NEW_USER}" >/dev/null 2>&1 || true
+}
+
+enable_nopasswd_sudo() {
+  local file="/etc/sudoers.d/90-${NEW_USER}-nopasswd"
+  log "Enabling passwordless sudo for '${NEW_USER}' via ${file}"
+
+  cat > "${file}" <<EOF
+${NEW_USER} ALL=(ALL) NOPASSWD:ALL
+EOF
+
+  chmod 440 "${file}"
+
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "${file}" >/dev/null
+  fi
+}
+
 backup_file() {
   local f="$1"
   local ts
@@ -108,7 +120,6 @@ backup_file() {
 }
 
 set_sshd_option() {
-  # Ensures a setting exists once (replace if present, else append)
   local file="$1"
   local key="$2"
   local value="$3"
@@ -186,15 +197,29 @@ reload_sshd() {
   fi
 }
 
+smoke_test_sudo() {
+  log "Smoke test: sudo as '${NEW_USER}'"
+  if sudo -u "${NEW_USER}" -H bash -lc 'sudo -n true' >/dev/null 2>&1; then
+    echo "sudo works for ${NEW_USER} without a password"
+  else
+    echo "Warning: sudo test failed for ${NEW_USER}. Check group membership and sudoers."
+  fi
+}
+
 main() {
   log "Ensuring user exists"
   ensure_user
 
-  log "Ensuring sudo access"
+  log "Ensuring admin group membership"
   ensure_admin_group
 
   log "Copying root SSH keys"
   copy_ssh_keys
+
+  log "Locking user password and enabling passwordless sudo"
+  lock_user_password
+  enable_nopasswd_sudo
+  smoke_test_sudo
 
   log "Hardening SSH daemon config"
   harden_sshd
